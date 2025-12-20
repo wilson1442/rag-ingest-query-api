@@ -1,129 +1,172 @@
 import os
+import time
 import logging
-from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 
+import chromadb
+from chromadb.config import Settings
 import requests
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from chromadb import PersistentClient
 
 
 # -----------------------------
-# Config
+# Logging
 # -----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("rag_query_api")
-
-SERVICE_NAME = "rag-query-api"
-SERVICE_VERSION = "1.0.0"
-STARTED_AT = datetime.now(timezone.utc).isoformat()
-
-CHROMA_PATH = os.getenv("CHROMA_PATH", "/mnt/ai-data/chroma")
-
-OLLAMA_EMBED_URL = os.getenv(
-    "OLLAMA_EMBED_URL",
-    "http://127.0.0.1:11434/api/embeddings"
-)
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-DEFAULT_TOP_K = int(os.getenv("TOP_K", "6"))
-
-chroma = PersistentClient(path=CHROMA_PATH)
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("query_api")
 
 
 # -----------------------------
-# Helpers
+# Environment
+# -----------------------------
+CHROMA_HOST = os.getenv("CHROMA_HOST", "127.0.0.1")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "7000"))
+CHROMA_SSL = os.getenv("CHROMA_SSL", "false").lower() in ("1", "true", "yes", "on")
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+
+DEFAULT_COLLECTION = os.getenv("DEFAULT_COLLECTION", "default")
+QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "60"))
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
+
+
+# -----------------------------
+# FastAPI
+# -----------------------------
+app = FastAPI(
+    title="RAG Query API (Read-Only)",
+    version="2.0.0",
+    description="Read-only semantic query API for ChromaDB (safe for OpenWebUI)."
+)
+
+
+# -----------------------------
+# Chroma client
+# -----------------------------
+def get_chroma_client() -> chromadb.HttpClient:
+    return chromadb.HttpClient(
+        host=CHROMA_HOST,
+        port=CHROMA_PORT,
+        ssl=CHROMA_SSL,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
+# -----------------------------
+# Embeddings
 # -----------------------------
 def embed_query(text: str) -> List[float]:
-    r = requests.post(
-        OLLAMA_EMBED_URL,
-        json={"model": EMBED_MODEL, "prompt": text},
-        timeout=60
-    )
-    r.raise_for_status()
-    emb = r.json().get("embedding")
-    if not emb:
-        raise HTTPException(500, "Embedding failed")
-    return emb
-
-def list_collections() -> List[str]:
-    return sorted(c.name for c in chroma.list_collections())
+    payload = {"model": EMBED_MODEL, "prompt": text}
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=QUERY_TIMEOUT_SECONDS)
+        r.raise_for_status()
+        data = r.json()
+        vec = data.get("embedding")
+        if not vec:
+            raise RuntimeError("Embedding missing in response")
+        return vec
+    except Exception as e:
+        logger.exception("Embedding request failed")
+        raise HTTPException(status_code=502, detail=f"Embedding service error: {str(e)}")
 
 
 # -----------------------------
 # Models
 # -----------------------------
 class QueryRequest(BaseModel):
-    query: str
-    collections: Optional[List[str]] = None
-    top_k: int = Field(DEFAULT_TOP_K, ge=1, le=50)
-    where: Optional[Dict[str, Any]] = None
+    query: str = Field(..., description="User query text")
+    collection: Optional[str] = Field(default=None, description="Collection to search")
+    n_results: Optional[int] = Field(default=5, description="Number of results")
+    where: Optional[Dict[str, Any]] = Field(default=None, description="Metadata filter")
+
+
+class QueryResult(BaseModel):
+    id: str
+    document: str
+    metadata: Dict[str, Any]
+    distance: float
+
+
+class QueryResponse(BaseModel):
+    collection: str
+    results: List[QueryResult]
+    elapsed_ms: int
+    timestamp: str
 
 
 # -----------------------------
-# API
+# Public endpoints (safe)
 # -----------------------------
-app = FastAPI(
-    title="RAG Query API",
-    version=SERVICE_VERSION,
-)
-
 @app.get("/health")
 def health():
-    chroma.list_collections()
     return {
         "status": "ok",
-        "service": SERVICE_NAME,
-        "started_at": STARTED_AT,
-        "chroma_path": CHROMA_PATH,
+        "service": "query",
+        "mode": "read-only",
+        "time": datetime.utcnow().isoformat() + "Z",
     }
+
+
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest):
+    start = time.time()
+
+    collection_name = (req.collection or DEFAULT_COLLECTION).strip()
+    if not collection_name:
+        raise HTTPException(status_code=400, detail="collection is required")
+
+    n_results = min(req.n_results or MAX_RESULTS, MAX_RESULTS)
+
+    client = get_chroma_client()
+
+    try:
+        col = client.get_collection(name=collection_name)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+
+    query_vec = embed_query(req.query)
+
+    try:
+        res = col.query(
+            query_embeddings=[query_vec],
+            n_results=n_results,
+            where=req.where,
+            include=["documents", "metadatas", "distances"],
+        )
+    except Exception as e:
+        logger.exception("Chroma query failed")
+        raise HTTPException(status_code=502, detail=f"Chroma query error: {str(e)}")
+
+    results: List[QueryResult] = []
+    for i in range(len(res["ids"][0])):
+        results.append(
+            QueryResult(
+                id=res["ids"][0][i],
+                document=res["documents"][0][i],
+                metadata=res["metadatas"][0][i] or {},
+                distance=res["distances"][0][i],
+            )
+        )
+
+    elapsed_ms = int((time.time() - start) * 1000)
+    return QueryResponse(
+        collection=collection_name,
+        results=results,
+        elapsed_ms=elapsed_ms,
+        timestamp=datetime.utcnow().isoformat() + "Z",
+    )
+
 
 @app.get("/collections")
-def collections():
-    return {"collections": list_collections()}
-
-@app.get("/collections/{name}/stats")
-def collection_stats(name: str):
-    col = chroma.get_collection(name)
-    return {
-        "collection": name,
-        "chunks": col.count(),
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-@app.post("/query")
-def query(req: QueryRequest):
-    cols = req.collections or list_collections()
-    if not cols:
-        raise HTTPException(404, "No collections found")
-
-    q_emb = embed_query(req.query)
-    hits = []
-
-    for cname in cols:
-        try:
-            col = chroma.get_collection(cname)
-            res = col.query(
-                query_embeddings=[q_emb],
-                n_results=req.top_k,
-                where=req.where,
-                include=["documents", "metadatas", "distances", "ids"],
-            )
-            for i, cid in enumerate(res["ids"][0]):
-                hits.append({
-                    "collection": cname,
-                    "id": cid,
-                    "distance": res["distances"][0][i],
-                    "document": res["documents"][0][i],
-                    "metadata": res["metadatas"][0][i],
-                })
-        except Exception as e:
-            logger.warning(f"Query failed for {cname}: {e}")
-
-    hits.sort(key=lambda x: x["distance"])
-    return {
-        "collections": cols,
-        "top_k": req.top_k,
-        "results": hits[:req.top_k],
-    }
+def list_collections():
+    """
+    Safe for OpenWebUI — listing only, no stats yet.
+    """
+    client = get_chroma_client()
+    cols = client.list_collections()
+    return {"collections": [c.name for c in cols]}

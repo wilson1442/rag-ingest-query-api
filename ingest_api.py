@@ -10,7 +10,7 @@ import requests
 import chromadb
 from chromadb.config import Settings
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -45,9 +45,9 @@ REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
 # FastAPI
 # -----------------------------
 app = FastAPI(
-    title="RAG Ingest API (Controlled Mutation)",
-    version="2.1.0",
-    description="Ingest-only API with explicit, gated rebuild endpoint."
+    title="RAG Ingest API",
+    version="2.2.0",
+    description="Ingest-only API with API-key protection and controlled rebuild."
 )
 
 
@@ -89,11 +89,11 @@ def get_chroma_client() -> chromadb.HttpClient:
     )
 
 
-def get_collection(client: chromadb.HttpClient, name: str):
+def get_or_create_collection(client, name: str):
     try:
         return client.get_collection(name=name)
     except Exception:
-        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+        return client.get_or_create_collection(name=name)
 
 
 # -----------------------------
@@ -102,8 +102,11 @@ def get_collection(client: chromadb.HttpClient, name: str):
 def embed_texts(texts: List[str]) -> List[List[float]]:
     vectors = []
     for t in texts:
-        payload = {"model": EMBED_MODEL, "prompt": t}
-        r = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        r = requests.post(
+            OLLAMA_URL,
+            json={"model": EMBED_MODEL, "prompt": t},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
         r.raise_for_status()
         vec = r.json().get("embedding")
         if not vec:
@@ -113,17 +116,35 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
 
 # -----------------------------
+# Chunking
+# -----------------------------
+def chunk_text(text: str) -> List[str]:
+    chunks = []
+    i = 0
+    while i < len(text):
+        end = min(i + MAX_CHUNK_CHARS, len(text))
+        chunks.append(text[i:end])
+        i = max(end - CHUNK_OVERLAP_CHARS, end)
+    return chunks
+
+
+# -----------------------------
 # Models
 # -----------------------------
-class RebuildRequest(BaseModel):
-    collection: str = Field(..., description="Collection to rebuild")
-    confirm: bool = Field(False, description="Must be true to proceed")
+class IngestDoc(BaseModel):
+    id: Optional[str] = None
+    text: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
-class RebuildResponse(BaseModel):
+class IngestRequest(BaseModel):
     collection: str
-    deleted_documents: int
-    timestamp: str
+    docs: List[IngestDoc]
+
+
+class RebuildRequest(BaseModel):
+    collection: str
+    confirm: bool = False
 
 
 # -----------------------------
@@ -147,29 +168,68 @@ def health():
 
 
 # -----------------------------
-# Controlled rebuild endpoint
+# Ingest endpoints
 # -----------------------------
-@app.post("/admin/rebuild", response_model=RebuildResponse, dependencies=[Depends(ingest_auth)])
-def rebuild_collection(req: RebuildRequest):
+@app.post("/ingest", dependencies=[Depends(ingest_auth)])
+def ingest(req: IngestRequest):
+    client = get_chroma_client()
+    col = get_or_create_collection(client, req.collection)
+
+    all_texts = []
+    all_ids = []
+    all_meta = []
+
+    for idx, d in enumerate(req.docs):
+        base_id = d.id or f"doc-{int(time.time()*1000)}-{idx}"
+        chunks = chunk_text(d.text)
+        for i, chunk in enumerate(chunks):
+            all_texts.append(chunk)
+            all_ids.append(f"{base_id}-{i}")
+            meta = d.metadata or {}
+            meta["chunk"] = i
+            all_meta.append(meta)
+
+    vectors = embed_texts(all_texts)
+    col.add(ids=all_ids, documents=all_texts, metadatas=all_meta, embeddings=vectors)
+
+    return {
+        "collection": req.collection,
+        "inserted_chunks": len(all_texts),
+    }
+
+
+@app.post("/ingest/file", dependencies=[Depends(ingest_auth)])
+async def ingest_file(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    collection = request.query_params.get("collection") or DEFAULT_COLLECTION
+    text = (await file.read()).decode("utf-8", errors="replace")
+
+    req = IngestRequest(
+        collection=collection,
+        docs=[IngestDoc(text=text, metadata={"filename": file.filename})],
+    )
+    return ingest(req)
+
+
+# -----------------------------
+# Controlled rebuild
+# -----------------------------
+@app.post("/admin/rebuild", dependencies=[Depends(ingest_auth)])
+def rebuild(req: RebuildRequest):
     if not req.confirm:
-        raise HTTPException(
-            status_code=400,
-            detail="Rebuild not confirmed. Set confirm=true to proceed."
-        )
+        raise HTTPException(status_code=400, detail="Rebuild not confirmed. Set confirm=true.")
 
     client = get_chroma_client()
-    col = get_collection(client, req.collection)
-
-    data = col.get(include=["ids"])
-    ids = data.get("ids", [])
-
-    deleted = len(ids)
+    col = client.get_collection(name=req.collection)
+    ids = col.get(include=["ids"]).get("ids", [])
 
     if ids:
         col.delete(ids=ids)
 
-    return RebuildResponse(
-        collection=req.collection,
-        deleted_documents=deleted,
-        timestamp=datetime.utcnow().isoformat() + "Z",
-    )
+    return {
+        "collection": req.collection,
+        "deleted_documents": len(ids),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }

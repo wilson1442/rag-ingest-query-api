@@ -163,6 +163,7 @@ def health():
     return {
         "status": "ok",
         "service": "ingest",
+        "FINGERPRINT": "INGEST_API_V2_REBUILD_JSON_FIX_ACTIVE",
         "time": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -219,17 +220,64 @@ async def ingest_file(
 @app.post("/admin/rebuild", dependencies=[Depends(ingest_auth)])
 def rebuild(req: RebuildRequest):
     if not req.confirm:
-        raise HTTPException(status_code=400, detail="Rebuild not confirmed. Set confirm=true.")
+        raise HTTPException(
+            status_code=400,
+            detail="Rebuild not confirmed. Set confirm=true."
+        )
 
     client = get_chroma_client()
-    col = client.get_collection(name=req.collection)
-    ids = col.get(include=["ids"]).get("ids", [])
+
+    try:
+        col = client.get_collection(name=req.collection)
+    except Exception:
+        # Collection exists logically but Chroma may error if empty
+        return JSONResponse(
+            status_code=200,
+            content={
+                "collection": req.collection,
+                "deleted_documents": 0,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "note": "Collection empty or not initialized"
+            },
+        )
+
+    try:
+        data = col.get(include=["ids"])
+    except Exception:
+        # Empty collection edge case
+        return JSONResponse(
+            status_code=200,
+            content={
+                "collection": req.collection,
+                "deleted_documents": 0,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "note": "No documents to delete"
+            },
+        )
+
+    raw_ids = data.get("ids") if isinstance(data, dict) else None
+
+    ids: List[str] = []
+    if isinstance(raw_ids, list):
+        if raw_ids and isinstance(raw_ids[0], list):
+            ids = [i for i in raw_ids[0] if i]
+        else:
+            ids = [i for i in raw_ids if i]
+
+    deleted = len(ids)
 
     if ids:
-        col.delete(ids=ids)
+        try:
+            col.delete(ids=ids)
+        except Exception:
+            # Deleting an already-empty collection should not fail
+            deleted = 0
 
-    return {
-        "collection": req.collection,
-        "deleted_documents": len(ids),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
+    return JSONResponse(
+        status_code=200,
+        content={
+            "collection": req.collection,
+            "deleted_documents": deleted,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        },
+    )

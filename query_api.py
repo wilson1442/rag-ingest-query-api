@@ -39,9 +39,9 @@ MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
 # FastAPI
 # -----------------------------
 app = FastAPI(
-    title="RAG Query API (Read-Only)",
-    version="2.0.0",
-    description="Read-only semantic query API for ChromaDB (safe for OpenWebUI)."
+    title="RAG Query API (Read-Only + Stats)",
+    version="2.1.0",
+    description="Read-only query API with collection-level stats (safe for OpenWebUI)."
 )
 
 
@@ -79,10 +79,10 @@ def embed_query(text: str) -> List[float]:
 # Models
 # -----------------------------
 class QueryRequest(BaseModel):
-    query: str = Field(..., description="User query text")
-    collection: Optional[str] = Field(default=None, description="Collection to search")
-    n_results: Optional[int] = Field(default=5, description="Number of results")
-    where: Optional[Dict[str, Any]] = Field(default=None, description="Metadata filter")
+    query: str
+    collection: Optional[str] = None
+    n_results: Optional[int] = 5
+    where: Optional[Dict[str, Any]] = None
 
 
 class QueryResult(BaseModel):
@@ -99,8 +99,14 @@ class QueryResponse(BaseModel):
     timestamp: str
 
 
+class CollectionStats(BaseModel):
+    name: str
+    document_count: int
+    metadata_keys: List[str]
+
+
 # -----------------------------
-# Public endpoints (safe)
+# Health
 # -----------------------------
 @app.get("/health")
 def health():
@@ -112,6 +118,28 @@ def health():
     }
 
 
+@app.get("/admin/health")
+def admin_health():
+    """
+    Confirms Chroma connectivity + collection count.
+    """
+    try:
+        client = get_chroma_client()
+        cols = client.list_collections()
+        return {
+            "status": "ok",
+            "chroma": "reachable",
+            "collection_count": len(cols),
+            "time": datetime.utcnow().isoformat() + "Z",
+        }
+    except Exception as e:
+        logger.exception("Chroma health check failed")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# -----------------------------
+# Query (read-only)
+# -----------------------------
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
     start = time.time()
@@ -123,7 +151,6 @@ def query(req: QueryRequest):
     n_results = min(req.n_results or MAX_RESULTS, MAX_RESULTS)
 
     client = get_chroma_client()
-
     try:
         col = client.get_collection(name=collection_name)
     except Exception:
@@ -131,16 +158,12 @@ def query(req: QueryRequest):
 
     query_vec = embed_query(req.query)
 
-    try:
-        res = col.query(
-            query_embeddings=[query_vec],
-            n_results=n_results,
-            where=req.where,
-            include=["documents", "metadatas", "distances"],
-        )
-    except Exception as e:
-        logger.exception("Chroma query failed")
-        raise HTTPException(status_code=502, detail=f"Chroma query error: {str(e)}")
+    res = col.query(
+        query_embeddings=[query_vec],
+        n_results=n_results,
+        where=req.where,
+        include=["documents", "metadatas", "distances"],
+    )
 
     results: List[QueryResult] = []
     for i in range(len(res["ids"][0])):
@@ -153,20 +176,61 @@ def query(req: QueryRequest):
             )
         )
 
-    elapsed_ms = int((time.time() - start) * 1000)
     return QueryResponse(
         collection=collection_name,
         results=results,
-        elapsed_ms=elapsed_ms,
+        elapsed_ms=int((time.time() - start) * 1000),
         timestamp=datetime.utcnow().isoformat() + "Z",
     )
 
 
-@app.get("/collections")
-def list_collections():
-    """
-    Safe for OpenWebUI — listing only, no stats yet.
-    """
+# -----------------------------
+# Collection stats (read-only)
+# -----------------------------
+@app.get("/admin/collections", response_model=List[CollectionStats])
+def list_collections_with_stats():
     client = get_chroma_client()
     cols = client.list_collections()
-    return {"collections": [c.name for c in cols]}
+
+    stats: List[CollectionStats] = []
+
+    for c in cols:
+        col = client.get_collection(name=c.name)
+        data = col.get(include=["metadatas"])
+        metadata_keys = set()
+
+        for md in data.get("metadatas", []):
+            if md:
+                metadata_keys.update(md.keys())
+
+        stats.append(
+            CollectionStats(
+                name=c.name,
+                document_count=len(data.get("metadatas", [])),
+                metadata_keys=sorted(metadata_keys),
+            )
+        )
+
+    return stats
+
+
+@app.get("/admin/collections/{name}", response_model=CollectionStats)
+def collection_stats(name: str):
+    client = get_chroma_client()
+    try:
+        col = client.get_collection(name=name)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    data = col.get(include=["metadatas"])
+    metadata_keys = set()
+
+    for md in data.get("metadatas", []):
+        if md:
+            metadata_keys.update(md.keys())
+
+    return CollectionStats(
+        name=name,
+        document_count=len(data.get("metadatas", [])),
+        metadata_keys=sorted(metadata_keys),
+    )

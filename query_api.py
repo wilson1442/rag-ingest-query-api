@@ -10,7 +10,9 @@ import requests
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
 
+from chromadb import PersistentClient
 
 # -----------------------------
 # Logging
@@ -26,6 +28,10 @@ logger = logging.getLogger("query_api")
 CHROMA_HOST = os.getenv("CHROMA_HOST", "127.0.0.1")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "7000"))
 CHROMA_SSL = os.getenv("CHROMA_SSL", "false").lower() in ("1", "true", "yes", "on")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "/mnt/ai-data/chroma")
+
+chroma = PersistentClient(path=CHROMA_PATH)
+
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
@@ -80,8 +86,8 @@ def embed_query(text: str) -> List[float]:
 # -----------------------------
 class QueryRequest(BaseModel):
     query: str
-    collection: Optional[str] = None
-    n_results: Optional[int] = 5
+    collections: Optional[List[str]] = None
+    top_k: int = 5
     where: Optional[Dict[str, Any]] = None
 
 
@@ -140,48 +146,44 @@ def admin_health():
 # -----------------------------
 # Query (read-only)
 # -----------------------------
-@app.post("/query", response_model=QueryResponse)
+@app.post("/query")
 def query(req: QueryRequest):
-    start = time.time()
+    # Use explicitly provided collections, otherwise search all collections
+    if req.collections and len(req.collections) > 0:
+        cols = req.collections
+    else:
+        cols = list_collections()
 
-    collection_name = (req.collection or DEFAULT_COLLECTION).strip()
-    if not collection_name:
-        raise HTTPException(status_code=400, detail="collection is required")
+    if not cols:
+        raise HTTPException(status_code=404, detail="No collections found")
 
-    n_results = min(req.n_results or MAX_RESULTS, MAX_RESULTS)
+    q_emb = embed_query(req.query)
+    hits = []
 
-    client = get_chroma_client()
-    try:
-        col = client.get_collection(name=collection_name)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
-
-    query_vec = embed_query(req.query)
-
-    res = col.query(
-        query_embeddings=[query_vec],
-        n_results=n_results,
-        where=req.where,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    results: List[QueryResult] = []
-    for i in range(len(res["ids"][0])):
-        results.append(
-            QueryResult(
-                id=res["ids"][0][i],
-                document=res["documents"][0][i],
-                metadata=res["metadatas"][0][i] or {},
-                distance=res["distances"][0][i],
-            )
+    for cname in cols:
+        col = chroma.get_collection(name=cname)
+        res = col.query(
+            query_embeddings=[q_emb],
+            n_results=req.top_k,
+            where=req.where,
+            include=["documents", "metadatas", "distances"],
         )
 
-    return QueryResponse(
-        collection=collection_name,
-        results=results,
-        elapsed_ms=int((time.time() - start) * 1000),
-        timestamp=datetime.utcnow().isoformat() + "Z",
-    )
+        for i, cid in enumerate(res["ids"][0]):
+            hits.append({
+                "collection": cname,
+                "id": cid,
+                "distance": res["distances"][0][i],
+                "document": res["documents"][0][i],
+                "metadata": res["metadatas"][0][i],
+            })
+
+    hits.sort(key=lambda x: x["distance"])
+    return {
+        "collections": cols,
+        "top_k": req.top_k,
+        "results": hits[:req.top_k],
+    }
 
 
 # -----------------------------

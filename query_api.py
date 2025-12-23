@@ -12,8 +12,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
-from chromadb import PersistentClient
-
 # -----------------------------
 # Logging
 # -----------------------------
@@ -29,9 +27,6 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "127.0.0.1")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "7000"))
 CHROMA_SSL = os.getenv("CHROMA_SSL", "false").lower() in ("1", "true", "yes", "on")
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/mnt/ai-data/chroma")
-
-chroma = PersistentClient(path=CHROMA_PATH)
-
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
@@ -52,15 +47,35 @@ app = FastAPI(
 
 
 # -----------------------------
-# Chroma client
+# Chroma client singleton
 # -----------------------------
+_chroma_client: Optional[chromadb.HttpClient] = None
+
 def get_chroma_client() -> chromadb.HttpClient:
-    return chromadb.HttpClient(
-        host=CHROMA_HOST,
-        port=CHROMA_PORT,
-        ssl=CHROMA_SSL,
-        settings=Settings(anonymized_telemetry=False),
-    )
+    """
+    Returns a singleton Chroma HttpClient instance.
+    Creates the client on first call and reuses it for all subsequent calls.
+    """
+    global _chroma_client
+    if _chroma_client is None:
+        _chroma_client = chromadb.HttpClient(
+            host=CHROMA_HOST,
+            port=CHROMA_PORT,
+            ssl=CHROMA_SSL,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        logger.info(f"Initialized Chroma client: {CHROMA_HOST}:{CHROMA_PORT} (SSL={CHROMA_SSL})")
+    return _chroma_client
+
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def list_collections() -> List[str]:
+    """Returns a list of all collection names in Chroma."""
+    client = get_chroma_client()
+    collections = client.list_collections()
+    return [col.name for col in collections]
 
 
 # -----------------------------
@@ -159,9 +174,10 @@ def query(req: QueryRequest):
 
     q_emb = embed_query(req.query)
     hits = []
+    client = get_chroma_client()
 
     for cname in cols:
-        col = chroma.get_collection(name=cname)
+        col = client.get_collection(name=cname)
         res = col.query(
             query_embeddings=[q_emb],
             n_results=req.top_k,

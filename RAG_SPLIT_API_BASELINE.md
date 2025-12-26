@@ -1,9 +1,9 @@
 # Split RAG API Baseline
 ## Ingest / Query Separation – Locked Architecture
 
-**Status:** Locked  
-**Baseline Version:** v1.0  
-**Last Updated:** 2025-12-20  
+**Status:** Locked
+**Baseline Version:** v1.1
+**Last Updated:** 2025-12-26
 **Repository:** rag-ingest-query-api  
 
 ---
@@ -67,8 +67,8 @@ This baseline was created after completing **Steps 1–4** of the hardening plan
 
 ### 3.2 Query API
 - Path: `query_api.py`
-- Purpose: Read-only semantic search and stats
-- Authentication: None (safe by design)
+- Purpose: Read-only semantic search and stats + protected collection management
+- Authentication: Optional (required only for destructive operations)
 - Exposure: OpenWebUI, tools, dashboards
 
 ---
@@ -142,20 +142,37 @@ Unauthenticated health check.
 
 ### 5.1 Design Guarantees
 
-The Query API **cannot**:
+The Query API is **primarily read-only** and cannot:
 - Add documents
 - Update metadata
-- Delete documents
+- Delete individual documents
 - Rebuild collections
 
-Even if misused, there is **no mutation code path**.
+**Exception:** The Query API includes one protected destructive endpoint (`DELETE /admin/collections/{name}`) that requires API key authentication. This endpoint can clear entire collections but is separated from read-only operations.
 
 ---
 
-### 5.2 Query Endpoints
+### 5.2 Environment Variables
+
+| Variable | Purpose | Required |
+|----------|---------|----------|
+| `ADMIN_API_KEY` | Required for destructive operations | Optional |
+| `CHROMA_HOST` | Chroma endpoint | Yes |
+| `CHROMA_PORT` | Chroma port | Yes |
+| `OLLAMA_URL` | Embedding endpoint | Yes |
+| `EMBED_MODEL` | Embedding model name | Yes |
+
+---
+
+### 5.3 Query Endpoints
 
 #### `GET /health`
 Read-only service health.
+
+#### `GET /collections`
+List all collection names (read-only, no authentication required).
+
+Returns a simple array of collection names.
 
 #### `POST /query`
 Semantic search endpoint.
@@ -167,22 +184,50 @@ Supports:
 
 ---
 
-### 5.3 Admin & Stats Endpoints (Step 3)
+### 5.4 Admin & Stats Endpoints
 
 #### `GET /admin/health`
 - Confirms Chroma connectivity
 - Returns collection count
 
 #### `GET /admin/collections`
-Returns per-collection:
+Returns detailed stats for all collections (read-only, no authentication required):
 - Collection name
-- Document count
+- Document count (unique documents based on chunk=0)
+- Chunk count (total chunks stored)
+- Embedding model used
 - Metadata keys present
 
 #### `GET /admin/collections/{name}`
-Returns stats for a single collection.
+Returns detailed stats for a single collection (read-only, no authentication required):
+- Collection name
+- Document count
+- Chunk count
+- Embedding model
+- Metadata keys
 
-**All admin endpoints are read-only.**
+---
+
+### 5.5 Protected Collection Management Endpoints
+
+#### `DELETE /admin/collections/{name}`
+**Requires API key authentication** via `ADMIN_API_KEY`.
+
+Clears all contents of a specific collection:
+- Deletes all documents/chunks from the collection
+- Keeps the collection itself intact
+- Returns deletion count and timestamp
+
+**Authentication:**
+- Supports `x-api-key` header
+- Supports `Authorization: Bearer <token>` header
+- Fails with 401 if key is invalid or missing
+- Fails with 500 if `ADMIN_API_KEY` not configured
+
+**Safety:**
+- Cannot be called without authentication
+- Single collection only (no wildcards)
+- Returns count of deleted chunks for audit trail
 
 ---
 
@@ -192,12 +237,15 @@ OpenWebUI:
 - **ONLY points to Query API**
 - Never sees ingest endpoints
 - Never holds API keys
-- Cannot mutate data even if compromised
+- Cannot perform destructive operations (no ADMIN_API_KEY)
 
 Recommended usage:
 - RAG pipelines → `/query`
-- Tools → `/admin/collections`
+- Collection discovery → `/collections`
+- Collection stats → `/admin/collections`
 - Health checks → `/health`
+
+**Note:** OpenWebUI should NOT have access to `ADMIN_API_KEY`, preventing accidental or malicious collection clearing.
 
 ---
 
@@ -216,9 +264,17 @@ Recommended usage:
 3. Re-ingest data
 4. Validate via Query API stats
 
-### 7.3 Monitoring
+### 7.3 Clear Collection
+1. Confirm target collection via `/admin/collections/{name}`
+2. Call `DELETE /admin/collections/{name}` with:
+   - API key (`x-api-key` header or `Authorization: Bearer` token)
+3. Verify deletion count in response
+4. Optional: Re-ingest fresh data
+
+### 7.4 Monitoring
 - Query API `/admin/health`
 - Collection counts via `/admin/collections`
+- Detailed collection stats via `/admin/collections/{name}`
 
 ---
 
@@ -230,11 +286,16 @@ This baseline was created through **atomic feature branches**:
 2. Make query API read-only
 3. Add collection stats & admin endpoints
 4. Add controlled rebuild endpoint
+5. Add collection management endpoints (v1.1)
+   - Simple collection listing
+   - Enhanced stats with chunk count and embedding model
+   - Protected collection clear endpoint
 
 Any future changes should:
 - Use feature branches
 - Include PR review
 - Update this document if behavior changes
+- Increment version number for significant features
 
 ---
 
@@ -251,12 +312,23 @@ Then **this baseline has been violated** and must be reviewed.
 
 ---
 
-## 10. Next Planned Enhancements (Out of Scope)
+## 10. Changelog (v1.1)
 
-- Optional admin API key for stats
-- Audit logging for rebuilds
+**Changes from v1.0 to v1.1:**
+- Added `GET /collections` endpoint for simple collection listing
+- Enhanced collection stats with `chunk_count` and `embedding_model` fields
+- Added `DELETE /admin/collections/{name}` protected endpoint with API key authentication
+- Added `ADMIN_API_KEY` environment variable for Query API
+- Improved document count accuracy (counting by chunk=0 metadata)
+
+---
+
+## 11. Next Planned Enhancements (Out of Scope)
+
+- Audit logging for collection clear operations
 - Snapshot/backup endpoints
 - Role-based access layers
+- Separate read-only and admin API keys
 
 These are **not part of this baseline**.
 

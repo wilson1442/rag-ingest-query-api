@@ -337,7 +337,7 @@ def rebuild(req: RebuildRequest):
         )
 
     try:
-        data = col.get()
+        data = col.get(include=["ids"])
     except Exception:
         # Empty collection edge case
         return JSONResponse(

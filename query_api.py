@@ -1,5 +1,6 @@
 import os
 import time
+import hmac
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -8,7 +9,7 @@ import chromadb
 from chromadb.config import Settings
 import requests
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
@@ -23,6 +24,8 @@ logger = logging.getLogger("query_api")
 # -----------------------------
 # Environment
 # -----------------------------
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
 CHROMA_HOST = os.getenv("CHROMA_HOST", "127.0.0.1")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "7000"))
 CHROMA_SSL = os.getenv("CHROMA_SSL", "false").lower() in ("1", "true", "yes", "on")
@@ -66,6 +69,35 @@ def get_chroma_client() -> chromadb.HttpClient:
         )
         logger.info(f"Initialized Chroma client: {CHROMA_HOST}:{CHROMA_PORT} (SSL={CHROMA_SSL})")
     return _chroma_client
+
+
+# -----------------------------
+# Auth
+# -----------------------------
+def extract_api_key(request: Request) -> str:
+    """Extract API key from x-api-key header or Authorization Bearer token."""
+    key = request.headers.get("x-api-key", "").strip()
+    if key:
+        return key
+    auth = request.headers.get("authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def require_admin_key(request: Request):
+    """Require valid ADMIN_API_KEY for protected endpoints."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: ADMIN_API_KEY not set")
+
+    presented = extract_api_key(request)
+    if not presented or not hmac.compare_digest(presented, ADMIN_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def admin_auth(request: Request):
+    """Dependency for admin-protected endpoints."""
+    require_admin_key(request)
 
 
 # -----------------------------
@@ -123,6 +155,8 @@ class QueryResponse(BaseModel):
 class CollectionStats(BaseModel):
     name: str
     document_count: int
+    chunk_count: int
+    embedding_model: str
     metadata_keys: List[str]
 
 
@@ -156,6 +190,17 @@ def admin_health():
     except Exception as e:
         logger.exception("Chroma health check failed")
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# -----------------------------
+# Collections (read-only)
+# -----------------------------
+@app.get("/collections", response_model=List[str])
+def get_collections():
+    """
+    List all collection names (read-only, no auth required).
+    """
+    return list_collections()
 
 
 # -----------------------------
@@ -207,6 +252,10 @@ def query(req: QueryRequest):
 # -----------------------------
 @app.get("/admin/collections", response_model=List[CollectionStats])
 def list_collections_with_stats():
+    """
+    List all collections with detailed statistics including document count,
+    chunk count, embedding model, and metadata keys.
+    """
     client = get_chroma_client()
     cols = client.list_collections()
 
@@ -217,14 +266,30 @@ def list_collections_with_stats():
         data = col.get(include=["metadatas"])
         metadata_keys = set()
 
+        # Track unique base document IDs (before chunk suffix)
+        unique_doc_ids = set()
+
         for md in data.get("metadatas", []):
             if md:
                 metadata_keys.update(md.keys())
 
+        # Count chunks (total entries in collection)
+        chunk_count = len(data.get("metadatas", []))
+
+        # Estimate document count by counting entries with chunk=0
+        # This assumes chunks are numbered starting from 0
+        document_count = sum(1 for md in data.get("metadatas", []) if md and md.get("chunk") == 0)
+
+        # If no chunks have chunk=0, fall back to total count
+        if document_count == 0 and chunk_count > 0:
+            document_count = chunk_count
+
         stats.append(
             CollectionStats(
                 name=c.name,
-                document_count=len(data.get("metadatas", [])),
+                document_count=document_count,
+                chunk_count=chunk_count,
+                embedding_model=EMBED_MODEL,
                 metadata_keys=sorted(metadata_keys),
             )
         )
@@ -234,6 +299,10 @@ def list_collections_with_stats():
 
 @app.get("/admin/collections/{name}", response_model=CollectionStats)
 def collection_stats(name: str):
+    """
+    Get detailed statistics for a specific collection including document count,
+    chunk count, embedding model, and metadata keys.
+    """
     client = get_chroma_client()
     try:
         col = client.get_collection(name=name)
@@ -247,8 +316,63 @@ def collection_stats(name: str):
         if md:
             metadata_keys.update(md.keys())
 
+    # Count chunks (total entries in collection)
+    chunk_count = len(data.get("metadatas", []))
+
+    # Estimate document count by counting entries with chunk=0
+    document_count = sum(1 for md in data.get("metadatas", []) if md and md.get("chunk") == 0)
+
+    # If no chunks have chunk=0, fall back to total count
+    if document_count == 0 and chunk_count > 0:
+        document_count = chunk_count
+
     return CollectionStats(
         name=name,
-        document_count=len(data.get("metadatas", [])),
+        document_count=document_count,
+        chunk_count=chunk_count,
+        embedding_model=EMBED_MODEL,
         metadata_keys=sorted(metadata_keys),
     )
+
+
+@app.delete("/admin/collections/{name}", dependencies=[Depends(admin_auth)])
+def clear_collection(name: str):
+    """
+    Clear all contents of a specific collection (requires API key authentication).
+    This endpoint deletes all documents/chunks from the collection but keeps the collection itself.
+    """
+    client = get_chroma_client()
+    try:
+        col = client.get_collection(name=name)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    try:
+        # Get all IDs from the collection (ids are returned by default, no need to specify in include)
+        data = col.get()
+        raw_ids = data.get("ids") if isinstance(data, dict) else None
+
+        ids = []
+        if isinstance(raw_ids, list):
+            if raw_ids and isinstance(raw_ids[0], list):
+                ids = [i for i in raw_ids[0] if i]
+            else:
+                ids = [i for i in raw_ids if i]
+
+        deleted = len(ids)
+
+        if ids:
+            col.delete(ids=ids)
+            logger.info(f"Cleared {deleted} chunks from collection '{name}'")
+        else:
+            logger.info(f"Collection '{name}' was already empty")
+
+        return {
+            "collection": name,
+            "deleted_chunks": deleted,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+
+    except Exception as e:
+        logger.exception(f"Failed to clear collection '{name}'")
+        raise HTTPException(status_code=500, detail=f"Failed to clear collection: {str(e)}")

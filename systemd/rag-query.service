@@ -13,6 +13,7 @@ Environment=CHROMA_PORT=7000
 Environment=OLLAMA_EMBED_URL=http://127.0.0.1:11434/api/embeddings
 Environment=EMBED_MODEL=nomic-embed-text
 Environment=CHROMA_PATH=/mnt/ai-data/chroma
+Environment=ADMIN_API_KEY=REPLACE_WITH_YOUR_GENERATED_KEY
 
 ExecStart=/opt/rag-split/venv/bin/uvicorn query_api:app --host 0.0.0.0 --port 8012
 Restart=always

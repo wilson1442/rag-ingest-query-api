@@ -348,8 +348,8 @@ def clear_collection(name: str):
         raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
 
     try:
-        # Get all IDs from the collection
-        data = col.get(include=["ids"])
+        # Get all IDs from the collection (ids are returned by default, no need to specify in include)
+        data = col.get()
         raw_ids = data.get("ids") if isinstance(data, dict) else None
 
         ids = []

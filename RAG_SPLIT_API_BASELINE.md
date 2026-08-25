@@ -2,8 +2,8 @@
 ## Ingest / Query Separation – Locked Architecture
 
 **Status:** Locked  
-**Baseline Version:** v1.0  
-**Last Updated:** 2025-12-20  
+**Baseline Version:** v1.1  
+**Last Updated:** 2026-08-25  
 **Repository:** rag-ingest-query-api  
 
 ---
@@ -25,19 +25,19 @@ This baseline was created after completing **Steps 1–4** of the hardening plan
 
 ## 2. High-Level Architecture
 
-                ┌────────────────────┐
+                ┌───────────────────┐
                 │   OpenWebUI / n8n   │
                 │  (Read-Only Access)│
                 └─────────┬──────────┘
                           │
                           ▼
-                ┌────────────────────┐
+                ┌───────────────────┐
                 │   Query API         │
                 │   (READ-ONLY)       │
                 └─────────┬──────────┘
                           │
                           ▼
-                ┌────────────────────┐
+                ┌───────────────────┐
                 │   ChromaDB          │
                 │   (Persistent)      │
                 └─────────┬──────────┘
@@ -46,7 +46,7 @@ This baseline was created after completing **Steps 1–4** of the hardening plan
                 ┌─────────┴──────────┐
                 │   Ingest API        │
                 │ (KEY-PROTECTED)    │
-                └────────────────────┘
+                └───────────────────┘
 
 ### Key Principles
 - **Ingest and Query are physically separate services**
@@ -54,6 +54,7 @@ This baseline was created after completing **Steps 1–4** of the hardening plan
 - **Ingest API is API-key protected and operator-only**
 - **OpenWebUI never touches ingest**
 - **Destructive actions require explicit confirmation**
+- **ChromaDB is bound to localhost only** — never exposed off-box
 
 ---
 
@@ -106,6 +107,7 @@ Unauthenticated health check.
 #### `POST /ingest`
 - Adds documents to a collection
 - Chunked + embedded
+- Idempotent upsert (deterministic IDs)
 - **Requires API key**
 
 #### `POST /ingest/file`
@@ -148,7 +150,9 @@ The Query API **cannot**:
 - Delete documents
 - Rebuild collections
 
-Even if misused, there is **no mutation code path**.
+Even if misused, there is **no mutation code path** in the read-only endpoints.
+(The single exception is `DELETE /admin/collections/{name}`, which is
+`ADMIN_API_KEY`-protected and fails closed.)
 
 ---
 
@@ -164,6 +168,20 @@ Supports:
 - Collection selection
 - Result limits
 - Metadata filters
+
+#### `GET /collections`
+List all collection names.
+
+#### `GET /collections/{name}/count`  *(added v1.1)*
+- Returns the chunk count for a collection using Chroma's native `count()` (O(1))
+- Read-only, no auth
+- Off-box replacement for a direct ChromaDB count
+
+#### `POST /collections/{name}/get`  *(added v1.1)*
+- Fetches raw documents from a collection
+- Body: `{ "ids": [...]?, "where": {...}?, "limit": 50? }`
+- Read-only, no auth
+- Off-box replacement for a direct ChromaDB `get`
 
 ---
 
@@ -182,7 +200,7 @@ Returns per-collection:
 #### `GET /admin/collections/{name}`
 Returns stats for a single collection.
 
-**All admin endpoints are read-only.**
+**All stats endpoints are read-only. `DELETE /admin/collections/{name}` is key-protected.**
 
 ---
 
@@ -191,12 +209,12 @@ Returns stats for a single collection.
 OpenWebUI:
 - **ONLY points to Query API**
 - Never sees ingest endpoints
-- Never holds API keys
+- Never holds ingest API keys
 - Cannot mutate data even if compromised
 
 Recommended usage:
 - RAG pipelines → `/query`
-- Tools → `/admin/collections`
+- Tools → `/admin/collections`, `/collections/{name}/count`, `/collections/{name}/get`
 - Health checks → `/health`
 
 ---
@@ -218,7 +236,7 @@ Recommended usage:
 
 ### 7.3 Monitoring
 - Query API `/admin/health`
-- Collection counts via `/admin/collections`
+- Collection counts via `/admin/collections` or `/collections/{name}/count`
 
 ---
 
@@ -244,8 +262,9 @@ This document reflects a **known-good, production-safe state**.
 
 If:
 - Mutation occurs without intent
-- Query gains write access
+- Query gains write access (other than the key-protected admin delete)
 - OpenWebUI can alter data
+- ChromaDB becomes reachable off-box
 
 Then **this baseline has been violated** and must be reviewed.
 
@@ -259,6 +278,24 @@ Then **this baseline has been violated** and must be reviewed.
 - Role-based access layers
 
 These are **not part of this baseline**.
+
+---
+
+## 11. Changelog
+
+### v1.1 — 2026-08-25
+- **Query API 2.1.0 → 2.2.0.** Added two read-only endpoints:
+  - `GET /collections/{name}/count` — native O(1) chunk count.
+  - `POST /collections/{name}/get` — raw document fetch by `ids` / `where` / `limit`.
+  These are off-box replacements for direct ChromaDB access.
+- **ChromaDB is bound to localhost only** (`127.0.0.1:7000`). All external
+  consumers go through the Ingest (8011) and Query (8012) APIs.
+- Deployment migrated off the retired MORPHEUS host onto a dedicated
+  Proxmox LXC. The application code is host-agnostic (host/port via env vars);
+  no code change was required for the move.
+
+### v1.0 — 2025-12-20
+- Initial locked baseline (hardening Steps 1–4).
 
 ---
 

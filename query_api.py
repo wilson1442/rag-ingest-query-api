@@ -44,8 +44,8 @@ MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
 # -----------------------------
 app = FastAPI(
     title="RAG Query API (Read-Only + Stats)",
-    version="2.1.0",
-    description="Read-only query API with collection-level stats (safe for OpenWebUI)."
+    version="2.2.0",
+    description="Read-only query API with collection-level stats and raw document access (safe for OpenWebUI)."
 )
 
 
@@ -160,6 +160,20 @@ class CollectionStats(BaseModel):
     metadata_keys: List[str]
 
 
+class GetRequest(BaseModel):
+    """
+    Request body for raw document retrieval (`POST /collections/{name}/get`).
+
+    All fields are optional:
+    - ids:   restrict the result to these chunk IDs
+    - where: Chroma metadata filter (e.g. {"source_type": "web_scrape"})
+    - limit: maximum number of chunks to return (default 50)
+    """
+    ids: Optional[List[str]] = None
+    where: Optional[Dict[str, Any]] = None
+    limit: Optional[int] = 50
+
+
 # -----------------------------
 # Health
 # -----------------------------
@@ -201,6 +215,68 @@ def get_collections():
     List all collection names (read-only, no auth required).
     """
     return list_collections()
+
+
+@app.get("/collections/{name}/count")
+def collection_count(name: str):
+    """
+    Return the number of stored chunks in a collection (read-only, no auth).
+
+    Uses Chroma's native count(), which is O(1) and does not materialize any
+    documents or metadata. This is the supported, off-box replacement for a
+    direct Chroma count now that Chroma is bound to localhost only (127.0.0.1)
+    and is not reachable from other hosts.
+    """
+    client = get_chroma_client()
+    try:
+        col = client.get_collection(name=name)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    return {"collection": name, "count": col.count()}
+
+
+@app.post("/collections/{name}/get")
+def collection_get(name: str, req: GetRequest):
+    """
+    Fetch raw documents from a collection by ID and/or metadata filter
+    (read-only, no auth required).
+
+    This is the supported, off-box replacement for a direct Chroma `/get` call
+    now that Chroma listens on localhost only (127.0.0.1). It exposes just the
+    read side of get(): optional `ids`, an optional metadata `where` filter, and
+    a `limit` (default 50). It cannot mutate data.
+    """
+    client = get_chroma_client()
+    try:
+        col = client.get_collection(name=name)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    # Only forward filters the caller actually supplied so we don't override
+    # Chroma defaults with None values.
+    kwargs: Dict[str, Any] = {"include": ["documents", "metadatas"]}
+    if req.ids:
+        kwargs["ids"] = req.ids
+    if req.where:
+        kwargs["where"] = req.where
+    if req.limit is not None:
+        kwargs["limit"] = req.limit
+
+    data = col.get(**kwargs)
+    ids = data.get("ids") or []
+    docs = data.get("documents") or []
+    metas = data.get("metadatas") or []
+
+    results = []
+    for i, cid in enumerate(ids):
+        results.append({
+            "id": cid,
+            "document": docs[i] if i < len(docs) else None,
+            "metadata": metas[i] if i < len(metas) else None,
+        })
+
+    return {"collection": name, "count": len(results), "results": results}
 
 
 # -----------------------------
